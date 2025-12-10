@@ -1,0 +1,217 @@
+---
+title: "475_Project_EDA"
+output: html_document
+date: "2025-11-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### Setup
+
+## Setup: dependencies
+
+install.packages("readr")
+install.packages("dplyr")
+install.packages("purr")
+install.packages("stringr")
+install.packages("readxl")
+install.packages("lubridate")
+install.packages("tidyr")
+install.packages("sf")
+install.packages("data.table")
+install.packages("ggplot2")
+
+library(ggplot2)
+library(data.table)
+library(sf)
+library(tidyr)
+library(lubridate)
+library(readxl)
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+
+
+## Setup: load into dataframe
+# load locations
+locations_folder <- "Rstudio_Resource_Files/locations/locations"
+location_files <-list.files(locations_folder, pattern = "\\.csv$", full.names = TRUE)
+locations <- location_files |>
+  set_names(basename(location_files)) |>
+  map_dfr(~ read_csv(.x, show_col_types = FALSE))
+  
+# load outlets            
+outlets <- read_excel("Rstudio_Resource_Files/outlets/outlets/2018 Food Outlets and PA.XLSM")
+
+# only keep important
+outlets <- outlets %>%
+  transmute(
+    outlet_id = coalesce(
+      as.character(`INFOUSA ID`),
+      paste0(`COMPANY NAME`, " | ", `LOCATION ADDRESS`, " | ", `LOCATION ADDRESS ZIP`)
+    ),
+    company_name = `COMPANY NAME`,
+    address      = `LOCATION ADDRESS`,
+    city         = `LOCATION ADDRESS CITY`,
+    state        = `LOCATION ADDRESS STATE`,
+    zip_code     = `LOCATION ADDRESS ZIP`,
+    lat          = `LATITUDE`,
+    lon          = `LONGITUDE`,
+    naics_code   = `PRIMARY NAICS CODE`,
+    naics_desc   = `PRIMARY NAICS DESCRIPTION`,
+    fastfood     = `FastFood`
+  )
+
+outlets <- outlets %>%
+  mutate(
+    fastfood = fastfood == 1,
+    lat = as.numeric(lat),
+    lon = as.numeric(lon),
+    lat = ifelse(lat > 90, lat / 1e6, lat),      # 47045933 -> 47.045933
+    lon = ifelse(lon > 180, lon / 1e6, lon),     # 122890245 -> 122.890245
+    lon = ifelse(lon > 0, -lon, lon)             # make West longitudes negative
+  )
+
+
+# transform: add breakfast/lunch/dinner windows
+locations <- locations |>
+  mutate(
+    hour = hour(datetime),
+    day = wday(datetime, label = TRUE),
+    meal_period = case_when(
+      hour < 10 ~ "Breakfast",
+      hour < 15 ~ "Lunch",
+      hour < 22 ~ "Dinner",
+      TRUE ~ "Late"
+    )
+  )
+  
+  
+### Spatial join
+
+# convert outlets to sf (points)
+outlets_sf <- st_as_sf(
+  outlets,
+  coords = c("lon", "lat"),
+  crs = 4326   # WGS84
+)
+
+# convert locations to sf (points)
+locations_sf <- st_as_sf(
+  locations,
+  coords = c("longitude", "latitude"),
+  crs = 4326
+)
+
+# project to meters
+outlets_sf   <- st_transform(outlets_sf, 3857)
+locations_sf <- st_transform(locations_sf, 3857)
+
+# buffer restaurants by 50m (this replaces the geometry; no extra column)
+outlets_buffered <- st_buffer(outlets_sf, 50)
+
+# spatial join: locations within any buffered outlet polygon
+# (this may produce multiple matches per point if buffers overlap)
+hits_raw <- st_join(
+  locations_sf,
+  outlets_buffered,
+  join = st_within,
+  left = FALSE
+)
+
+# compute distance from each location point to the matched outlet centroid
+# (use outlets_sf, which has point geometries)
+hits_raw <- hits_raw %>%
+  mutate(
+    dist_m = as.numeric(
+      st_distance(
+        geometry,
+        st_geometry(outlets_sf)[match(outlet_id, outlets_sf$outlet_id)],
+        by_element = TRUE
+      )
+    )
+  )
+
+# resolve overlaps: keep only the nearest outlet per (client_id, datetime)
+hits <- hits_raw %>%
+  group_by(client_id, datetime) %>%
+  slice_min(dist_m, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(client_id, datetime, outlet_id, company_name, fastfood, naics_desc)
+
+# order hits by time
+hits <- hits %>%
+  arrange(client_id, datetime)
+
+## calculate blocks of visits
+hits <- hits %>%
+  group_by(client_id) %>%
+  arrange(datetime, .by_group = TRUE) %>%
+  mutate(
+    # TRUE if outlet changes
+    outlet_change = outlet_id != lag(outlet_id, default = first(outlet_id)),
+    
+    # time gap in minutes
+    time_gap = as.numeric(difftime(datetime, lag(datetime, default = first(datetime)), units = "mins")),
+    
+    # new block when outlet changes or time gap > 10
+    new_block = outlet_change | time_gap > 10 | is.na(time_gap),
+    
+    block_id = cumsum(new_block)   # unique per client
+  ) %>%
+  ungroup()
+
+# 1) Drop geometry and convert to data.table
+hits_dt <- st_drop_geometry(hits)
+setDT(hits_dt)
+
+# 2) Ensure sorted by client/outlet/block/time
+setkey(hits_dt, client_id, outlet_id, block_id, datetime)
+
+# 3) Fast grouped aggregation
+episodes_dt <- hits_dt[, .(
+  start_time   = datetime[1L],
+  end_time     = datetime[.N],
+  dwell_min    = as.numeric(difftime(datetime[.N], datetime[1L], units = "mins")),
+  n_points     = .N,
+  company_name = company_name[1L],
+  fastfood     = fastfood[1L],
+  naics_desc   = naics_desc[1L]
+), by = .(client_id, outlet_id, block_id)]
+
+episodes <- as_tibble(episodes_dt)[order(episodes_dt$client_id, episodes_dt$start_time), ]
+
+
+dine_in_visits <- episodes %>%
+  filter(
+    dwell_min >= 12,      # must be long enough for dine-in
+    dwell_min <= 120,     # exclude home/work bias
+    n_points >= 3         # require ≥ 3 in-buffer timestamps
+  )
+
+### Visualizations
+
+# Map of dine in visits
+# aggregate visits per outlet
+visits_per_outlet <- dine_in_visits %>%
+  count(outlet_id, company_name, fastfood, naics_desc, name = "n_visits")
+
+# join onto spatial outlets
+outlets_visits_sf <- outlets_sf %>%
+  left_join(visits_per_outlet, by = c("outlet_id", "company_name", "fastfood", "naics_desc")) %>%
+  mutate(n_visits = replace_na(n_visits, 0))
+
+# simple map (no basemap, just points)
+ggplot(outlets_visits_sf) +
+  geom_sf(aes(size = n_visits, color = fastfood), alpha = 0.7) +
+  scale_size_continuous(range = c(1, 6)) +
+  labs(
+    title = "Dine-in Visits by Restaurant Location",
+    subtitle = "Point size = number of dine-in visits",
+    size = "# of visits",
+    color = "Fast food?"
+  ) +
+  theme_minimal()
+  
