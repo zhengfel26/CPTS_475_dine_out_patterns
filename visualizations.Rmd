@@ -1,0 +1,135 @@
+---
+title: "project_visualizations"
+date: "2025-11-15"
+output: html_document
+---
+
+# Currently working on more spatial visuals rather than the current (which are more analytical).
+
+# Will push when done
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Simple plot, a version already exists in current code
+```{r simple_spatial_plot}
+ggplot() +
+  geom_sf(data = outlets_buffered, fill = "grey70", alpha = 0.4, color = NA) +
+  geom_sf(data = outlets_sf, color = "black", size = 1.4) +
+  geom_sf(data = hits, color = "red", size = 0.8, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "Restaurant Buffers & Visits Overlay")
+```
+
+# Proportion of Fast Food vs Non-Fast food Visits
+```{r fastfood_vs_other}
+dine_in_visits %>%
+  mutate(fastfood = coalesce(fastfood, FALSE)) %>%
+  count(fastfood) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = "", y = pct, fill = fastfood)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c("#4E79A7", "#F28E2b"), labels = c("Non-Fastfood","Fastfood")) + labs(title = "Fast Food vs Non-fast food Visits", fill = "") + theme_void()
+```
+
+# Zoomable/Interactive Map (takes some time to run, I will need to check back on this later since I haven't waited for it to finish yet)
+```{r zoomable_map}
+tmap_mode("view")
+
+tm_shape(outlets_buffered) +
+  tm_polygons(col = "lightblue", alpha = 0.4, border.col = "blue") +
+tm_shape(outlets_visits_sf) +
+  tm_dots(col = "n_visits", size = "n_visits", palette = "Reds", scale = 1.5, title.size = "Visits") +
+tm_basemap("OpenStreetMap")
+```
+
+# Show fast food visits in a week compared to non-fast food
+```{r fast_food_over_week}
+library(scales)  # for percent_format function, will add to main .Rmd later
+
+# for stacked visualizations
+dine_counts_stacked <- dine_in_visits %>%
+  mutate(
+    fast = if_else(coalesce(fastfood, FALSE), "Fast Food", "Non-Fast Food")
+  ) %>%
+  mutate(day = wday(start_time, label = TRUE, abbr = TRUE, week_start = 1)) %>%
+  count(day, fast)
+
+ggplot(dine_counts_stacked, aes(x = day, y = n, fill = fast)) +
+  geom_col() +
+  scale_fill_manual(values = c("Fast Food" = "#FF0000", "Non-Fast Food" = "#4E79A7")) + labs(title = "Counts of Visits by Day: Fast Food vs Non-Fast",
+    x = "Day of Week",
+    y = "Number of Visits",
+    fill = "Restaurant Type"
+  ) +
+  theme_minimal()
+```
+
+# Chart to show peak dining periods (lunch, dinner, etc)
+# Shows the frequency which meals are eaten on a weekly basis
+```{r weekly_meal_frequency}
+dine_in_visits <- dine_in_visits %>%
+  mutate(
+    hour = hour(start_time),
+    day = wday(start_time, label = TRUE, abbr = TRUE),  # Mon, Tue, ...
+    meal_period = case_when(
+      hour < 10 ~ "Breakfast",
+      hour < 15 ~ "Lunch",
+      hour < 22 ~ "Dinner",
+      TRUE ~ "Late"
+    )
+  )
+
+# Count visits by day and meal period
+visits_by_day_meal <- dine_in_visits %>%
+  group_by(day, meal_period) %>%
+  summarise(n_visits = n(), .groups = "drop")
+
+# Plot
+ggplot(visits_by_day_meal, aes(x = day, y = n_visits, fill = meal_period)) +
+  geom_col(position = "dodge") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Visits by Day and Meal Period",
+    x = "Day of Week",
+    y = "Number of Visits",
+    fill = "Meal Period"
+  ) +
+  theme_minimal()
+```
+# Comparison of fastfood dwell times vs non-fastfoods
+# convert to time
+```{r fastfood_times}
+ggplot(dine_in_visits, aes(x = fastfood, y = dwell_min, fill = fastfood)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("Non-Fast Food", "Fast Food")) +
+  labs(
+    title = "Dwell Time Comparison: Fast Food vs Non-Fast-Food",
+    x = "",
+    y = "Dwell Time (minutes)"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c("steelblue", "salmon"))
+```
+
+```{r hotspot}
+outlets_visits_sf <- outlets_visits_sf %>%
+  mutate(
+    lon = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  )
+
+ggplot(outlets_visits_sf) +
+  stat_density_2d(
+    aes(x = lon, y = lat, fill = after_stat(level)),
+    geom = "polygon",
+    alpha = 0.6
+  ) +
+  scale_fill_viridis_c() +
+  geom_point(aes(x = lon, y = lat), size = 1, alpha = 0.3) +
+  coord_sf() +
+  theme_minimal() +
+  labs(title = "Hotspot Map of Restaurant Visits")
+```
